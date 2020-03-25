@@ -1,0 +1,13 @@
+register functions/sample
+
+table_create Values TABLE_NO_KEY
+column_create Values value COLUMN_SCALAR ShortText
+
+load --table Values
+[
+{"value": "a"},
+{"value": "b"},
+{"value": "c"}
+]
+
+select Values --filter 'all_records() && sample_selector("value", {"includes": ["a","c"]})'

@@ -8,17 +8,47 @@
 # define GNUC_UNUSED
 #endif
 
-static grn_obj *
-func_strlen(grn_ctx *ctx, GNUC_UNUSED int nargs, GNUC_UNUSED grn_obj **args,
-            grn_user_data *user_data)
-{
-  grn_obj *result;
-  unsigned int str_length = GRN_TEXT_LEN(args[0]);
 
-  if ((result = grn_plugin_proc_alloc(ctx, user_data, GRN_DB_INT64, 0))) {
-    GRN_INT64_SET(ctx, result, str_length);
+typedef struct _cache_entry cache_entry;
+struct _cache_entry {
+  grn_id id;
+  double data;
+};
+
+grn_hash *cache_keys = NULL;
+
+grn_plugin_mutex *mutex = NULL;
+
+static void
+add_cache(grn_ctx *ctx, const char *key, unsigned int key_length)
+{
+  grn_id id;
+  int added;
+  cache_entry *entry = NULL;
+
+  id = grn_hash_add(ctx, cache_keys,
+                    key,
+                    key_length,
+                    (void **)&entry, &added);
+  if (added) {
+    entry->id = id;
+    entry->data = 0.1;
   }
-  return result;
+}
+
+static cache_entry *
+get_cache(grn_ctx *ctx, const char *key, unsigned int key_length)
+{
+  grn_id id;
+  cache_entry *entry = NULL;
+
+  id = grn_hash_get(ctx, cache_keys,
+                    key,
+                    key_length,
+                    (void **)&entry);
+  if (id != GRN_ID_NIL && entry) {
+    return entry;
+  }
 }
 
 static grn_rc
@@ -69,90 +99,58 @@ selector_sample(grn_ctx *ctx, GNUC_UNUSED grn_obj *table, GNUC_UNUSED grn_obj *i
     grn_hash_cursor_close(ctx, cursor);
   }
 
-  include_keys = grn_hash_create(ctx, NULL,
-                                 GRN_TABLE_MAX_KEY_SIZE,
-                                 0,
-                                 GRN_OBJ_TABLE_HASH_KEY|GRN_OBJ_KEY_VAR_SIZE);
-  if (!include_keys) {
-    GRN_PLUGIN_ERROR(ctx, GRN_NO_MEMORY_AVAILABLE,
-                     "sample_selector(): failed to create include keys table");
-    goto exit;
-  }
-
-  switch (includes->header.type) {
-  case GRN_BULK :
-    {
-      const char *top, *cursor, *end;
-      top = GRN_TEXT_VALUE(includes);
-      cursor = top;
-      end = top + GRN_TEXT_LEN(includes);
-      for (; cursor <= end; cursor++) {
-        if (cursor[0] == ',' || cursor == end) {
-          grn_hash_add(ctx, include_keys, top, cursor - top, NULL, NULL);
-          top = cursor + 1;
-        }
-      }
+  char randkey[100];
+  sprintf(randkey, "%d", rand() % 10);
+  cache_entry *entry = NULL;
+  entry = get_cache(ctx, randkey, strlen(randkey));
+  if (!entry) {
+    grn_plugin_mutex_lock(ctx, mutex);
+    entry = get_cache(ctx, randkey, strlen(randkey));
+    if (!entry) {
+      add_cache(ctx, randkey, strlen(randkey));
     }
-    break;
-  case GRN_VECTOR :
-    {
-      /* implement me */
-    }
-    break;
-  default :
-    break;
+    grn_plugin_mutex_unlock(ctx, mutex);
   }
-
-  if (include_keys) {
-    grn_obj buf;
-    grn_obj *accessor;
-
-    GRN_VOID_INIT(&buf);
-
-    accessor = grn_obj_column(ctx, res,
-                              GRN_TEXT_VALUE(column_name),
-                               GRN_TEXT_LEN(column_name));
-    if (!accessor) {
-      GRN_PLUGIN_ERROR(ctx, GRN_NO_MEMORY_AVAILABLE,
-                       "sample_selector(): can't open column <%.*s>",
-                       (int32_t)GRN_TEXT_LEN(column_name),
-                       GRN_TEXT_VALUE(column_name));
-      goto exit;
-    }
-
-    GRN_HASH_EACH_BEGIN(ctx, (grn_hash *)res, cur, id) {
-      GRN_BULK_REWIND(&buf);
-      grn_obj_get_value(ctx, accessor, id, &buf);
-      if (grn_hash_get(ctx, include_keys, GRN_TEXT_VALUE(&buf), GRN_TEXT_LEN(&buf), NULL) == GRN_ID_NIL) {
-        grn_hash_cursor_delete(ctx, cur, NULL);
-      }
-    } GRN_HASH_EACH_END(ctx, cur);
-
-    grn_obj_close(ctx, accessor);
-    GRN_OBJ_FIN(ctx, &buf);
-  }
+  sleep(3);
 
 exit :
-
-  if (include_keys) {
-    grn_hash_close(ctx, include_keys);
-  }
 
   return rc;
 }
 
+
 grn_rc
 GRN_PLUGIN_INIT(GNUC_UNUSED grn_ctx *ctx)
 {
+  mutex = grn_plugin_mutex_open(ctx);
+
+  grn_plugin_mutex_lock(ctx, mutex);
+  cache_keys = grn_hash_create(ctx,
+                               NULL,
+                               GRN_TABLE_MAX_KEY_SIZE,
+                               sizeof(cache_entry),
+                               GRN_OBJ_KEY_VAR_SIZE);
+
+  grn_id id;
+  int added;
+  cache_entry *entry = NULL;
+
+  id = grn_hash_add(ctx, cache_keys,
+                    "cache_key",
+                    strlen("cache_key"),
+                    (void **)&entry, &added);
+  if (added) {
+    entry->id = id;
+    entry->data = 0.1;
+  }
+  grn_plugin_mutex_unlock(ctx, mutex);
+
   return GRN_SUCCESS;
 }
 
 grn_rc
 GRN_PLUGIN_REGISTER(grn_ctx *ctx)
 {
-  grn_proc_create(ctx, "strlen", -1, GRN_PROC_FUNCTION,
-                  func_strlen, NULL, NULL, 0, NULL);
-
 
   {
     grn_obj *selector_proc;
@@ -169,5 +167,21 @@ GRN_PLUGIN_REGISTER(grn_ctx *ctx)
 grn_rc
 GRN_PLUGIN_FIN(GNUC_UNUSED grn_ctx *ctx)
 {
+  if (mutex) {
+    grn_plugin_mutex_lock(ctx, mutex);
+    if (cache_keys) {
+      GRN_HASH_EACH_BEGIN(ctx, cache_keys, cursor, id) {
+        grn_hash_delete_by_id(ctx, cache_keys, id, NULL);
+      } GRN_HASH_EACH_END(ctx, cursor);
+      grn_hash_close(ctx, cache_keys);
+      cache_keys = NULL;
+    }
+
+    grn_plugin_mutex_unlock(ctx, mutex);
+
+    grn_plugin_mutex_close(ctx, mutex);
+    mutex = NULL;
+  }
+
   return GRN_SUCCESS;
 }
